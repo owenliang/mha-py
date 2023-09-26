@@ -71,11 +71,11 @@ while True:
     print('Master failover开始执行!')
 
     # 1，所有SLAVE节点stop slave io_thread
-    # 2，所有SLAVE节点等待Slave_SQL_Running_State: Slave has read all relay log; waiting for more updates出现
-    # 3，选取SLAVE中(Master_Log_File,Read_Master_Log_Pos)最新的节点作为新Master
+    # 2，选取SLAVE中(Master_Log_File,Read_Master_Log_Pos)最新的节点作为新Master
+    # 3，等待新Master的Slave_SQL_Running_State: Slave has read all relay log; waiting for more updates出现，此后其binlog内含最全数据，其他SLAVE可切过来
     # 4，所有SLAVE节点stop slave停止sql_thread
-    # 5，新Master执行reset slave all关停slave角色
-    # 6，新Master执行set read_only=0开放写入
-    # 7，所有SLAVE节点change master to新Master，并start slave
+    # 5，所有SLAVE节点change master to新Master，并start slave
+    # 6，新Master执行reset slave all关停slave角色
+    # 7，新Master执行set read_only=0开放写入
     # 8，执行Hook，通知变更完成、或者通知切换异常
     break
