@@ -52,9 +52,7 @@ class MasterSlaves:
         self.slave_wrappers=[DBWrapper(slave[0],slave[1],slave[2],slave[3]) for slave in slaves]
     
     def is_master_alive(self):
-        try:
-            self.master_wrapper.query('SELECT 1')
-        except:
+        if isinstance(self.run_sql(self.master_wrapper,"SELECT 1"),Exception):
             return False 
         return True
 
