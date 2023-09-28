@@ -1,19 +1,7 @@
 import pymysql
 from pymysql.cursors import DictCursor
 import time 
-import os 
-import sys 
 
-# Failover配置
-MAX_FAIL_TIMES=2
-
-# MySQL主从关系
-MASTER=('10.0.0.235',3306,'root','baidu@123')
-SLAVES=[
-    ('10.0.0.236',3306,'root','baidu@123'),
-]
-
-# DB客户端(无需关心连接释放)
 class DBWrapper:
     def __init__(self,host,port,user,password):
         self.host=host
@@ -55,97 +43,228 @@ class DBWrapper:
         finally:
             self._destroy()
 
-# 禁止连续Failover
-if os.path.exists('failover.flag'):
-    print('已经发生Failover，请人工介入!')
-    sys.exit(1)
+class MasterSlaves:
+    def __init__(self,master,slaves):
+        self.master=master
+        self.slaves=slaves
 
-master_wrapper=DBWrapper(MASTER[0],MASTER[1],MASTER[2],MASTER[3])
-slave_wrappers=[]
-for slave in SLAVES:
-    slave_wrappers.append(DBWrapper(slave[0],slave[1],slave[2],slave[3]))
-
-# Failover循环检查
-fail_times=0
-while True:
-    # 探测Master存活
-    try:
-        slave_status=master_wrapper.query('SELECT 1')
-    except Exception as e:
-        fail_times+=1
-        print('【Master探测】Master探测连续失败{}次,错误:{}'.format(fail_times, e))
-    else:
-        fail_times=0
-        print('【Master探测】Master运行正常,持续观测中...')
+        self.master_wrapper=DBWrapper(master[0],master[1],master[2],master[3])
+        self.slave_wrappers=[DBWrapper(slave[0],slave[1],slave[2],slave[3]) for slave in slaves]
     
-    # 未到达failover阈值 
-    if fail_times<MAX_FAIL_TIMES:
-        time.sleep(1)
-        continue
-    
-    # 触发failover流程
-    print('【Master故障】Master Failover开始执行!')
+    def is_master_alive(self):
+        try:
+            self.master_wrapper.query('SELECT 1')
+        except:
+            return False 
+        return True
 
-    try:
-        # 1，所有SLAVE节点stop slave io_thread
-        for i in range(len(SLAVES)):
-            slave_wrappers[i].exec('stop slave io_thread')
-             
-        # 2，选取SLAVE中(Master_Log_File,Read_Master_Log_Pos)最新的节点作为新Master
+    def desc_inst(inst):
+        return ''
+
+    def error(self,msg):
+        print('[ERROR] {}'.format(msg))
+
+    def info(self,msg):
+        print('[INFO] {}'.format(msg))
+
+    def run_sql(self,inst,sql,is_query=False):
+        role='MASTER'
+        if inst!=self.master_wrapper:
+            role='SLAVE'
+        try:
+            if is_query:
+                result=inst.query(sql)
+            else:
+                result=inst.exec(sql)
+        except Exception as e:
+            self.error('ROLE={} INSTANCE={}:{} SQL={} ERROR={}'.format(role,inst.host,inst.port,sql,e))
+            return e
+        else:
+            self.info('ROLE={} INSTANCE={}:{} SQL={} RESULT={}'.format(role,inst.host,inst.port,sql,result))
+            return result
+
+    def _set_readonly(self,inst,kill=False):
+        if isinstance(self.run_sql(inst,'set global read_only=1'),Exception):
+            return False 
+        if kill:
+            result=self.run_sql(inst,"select  concat('KILL ',id,';') as cmd  from information_schema.processlist where command not like '%Binlog%'",is_query=True)
+            if isinstance(result,Exception):
+                return False
+            for row in result:
+                result=self.run_sql(inst,row['cmd'])
+                if isinstance(result,Exception) and 'Unknown thread id' not in str(result):
+                    return False
+        return True
+    
+    def _off_readonly(self,inst):
+        if isinstance(self.run_sql(inst,'set global read_only=0'),Exception):
+            return False 
+        return True 
+        
+    def _start_slave(self,inst):
+        if isinstance(self.run_sql(inst,'start slave'),Exception):
+            return False 
+        return True 
+
+    def _stop_io(self,inst):
+        if isinstance(self.run_sql(inst,'stop slave io_thread'),Exception):
+            return False 
+        return True 
+
+    def _master_status(self):
+        status=self.run_sql(self.master_wrapper,'show master status',is_query=True)
+        if isinstance(status,Exception) or len(status)==0:
+            return False 
+        return status[0]
+
+    def _slave_status(self,inst):
+        status=self.run_sql(inst,'show slave status',is_query=True)
+        if isinstance(status,Exception) or len(status)==0:
+            return False 
+        return status[0]
+
+    def _slave_wait_binlog(self,inst,master_status,timeout=30):
+        st=time.time()
+        while True:
+            status=self._slave_status(inst)
+            if status:
+                if (status['Master_Host'],status['Master_Port'])!=(self.master[0],self.master[1]):
+                    return False 
+                if not status['Master_Log_File']:
+                    return False
+                if (status['Master_Log_File'],status['Read_Master_Log_Pos'])==(master_status['File'],master_status['Position']):
+                    return True
+            time.sleep(1)
+            if time.time()-st>=timeout:
+                return False
+
+    def _slave_wait_relay(self,inst,timeout=30):
+        st=time.time()
+        while True:
+            status=self._slave_status(inst)
+            if status:
+                if 'waiting for more updates' in status['Slave_SQL_Running_State']:
+                    return True
+            time.sleep(1)
+            if time.time()-st>=timeout:
+                return False
+
+    def _slave_stop_slave(self,inst):
+        if isinstance(self.run_sql(inst,'stop slave'),Exception):
+            return False
+        return True
+    
+    def _reset_slave(self,inst):
+        if isinstance(self.run_sql(inst,'reset slave all'),Exception):
+            return False
+        return True
+
+    def _change_master(self,inst,new_master):
+        SQL="CHANGE MASTER TO MASTER_HOST='{}', MASTER_PORT={},MASTER_USER='{}',MASTER_PASSWORD='{}',MASTER_AUTO_POSITION=1".format(new_master.host,new_master.port,new_master.user,new_master.password)
+        if isinstance(self.run_sql(inst,SQL),Exception):
+           return False
+        if isinstance(self.run_sql(inst,'start slave'),Exception):
+           return False
+        if not self._set_readonly(inst):
+            return False 
+        return True
+
+    def _find_latest_slave(self,slaves):
         latest_Master_Log_File=''
-        latest_Read_Master_Log_Pos=''
-        latest_slave_idx=0
-        for i in range(len(SLAVES)):
-            slave_status=slave_wrappers[i].query('show slave status')[0]
-            Master_Log_File=slave_status['Master_Log_File']
-            Read_Master_Log_Pos=slave_status['Read_Master_Log_Pos']
+        latest_Read_Master_Log_Pos=0
+        latest_slave=None
+        for s in slaves:
+            status=self._slave_status(s)
+            if not status:
+                return False 
+            Master_Log_File=status['Master_Log_File']
+            Read_Master_Log_Pos=status['Read_Master_Log_Pos']
             if Master_Log_File>latest_Master_Log_File or (Master_Log_File==latest_Master_Log_File and Read_Master_Log_Pos>latest_Read_Master_Log_Pos):
-                latest_slave_idx=i
+                latest_slave=s
                 latest_Master_Log_File=Master_Log_File
                 latest_Read_Master_Log_Pos=Read_Master_Log_Pos
-        print('【选举Master成功】当前Master->{}:{},候选Master->{}:{},Master_Log_File:{},Read_Master_Log_Pos:{}'.format(
-            MASTER[0],MASTER[1],
-            SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1],latest_Master_Log_File,latest_Read_Master_Log_Pos))
+        return latest_slave
 
-        # 3，等待新Master的Slave_SQL_Running_State: Slave has read all relay log; waiting for more updates出现，此后其binlog内含最全数据，其他SLAVE可切过来
-        while True:
-            latest_slave_status=slave_wrappers[latest_slave_idx].query('show slave status')[0]
-            Slave_SQL_Running=latest_slave_status['Slave_SQL_Running']
-            Master_Log_File=latest_slave_status['Master_Log_File']
-            Read_Master_Log_Pos=latest_slave_status['Read_Master_Log_Pos']
-            Relay_Master_Log_File=latest_slave_status['Relay_Master_Log_File']
-            Exec_Master_Log_Pos=latest_slave_status['Exec_Master_Log_Pos']
-            Slave_SQL_Running_State=latest_slave_status['Slave_SQL_Running_State']
-            if 'waiting for more updates' in Slave_SQL_Running_State:
-                break
-            print('【后续Master正在追Relay】候选Master->{}:{},Master_Log_File:{},Read_Master_Log_Pos:{},Relay_Master_Log_File:{},Exec_Master_Log_Pos:{}'.format(
-                SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1],Master_Log_File,Read_Master_Log_Pos,Relay_Master_Log_File,Exec_Master_Log_Pos))
-            time.sleep(1)
-        print('【候选Master Relay已追平】候选Master->{}:{},Master_Log_File:{},Read_Master_Log_Pos:{},Relay_Master_Log_File:{},Exec_Master_Log_Pos:{}'.format(
-                    SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1],Master_Log_File,Read_Master_Log_Pos,Relay_Master_Log_File,Exec_Master_Log_Pos))
+    def switch(self,force_master=None):   
+        # try to set master read only
+        master_alive=self.is_master_alive()
+        if master_alive:
+            if not self._set_readonly(self.master_wrapper,True):
+                raise Exception('set master readonly fail')
+            master_status=self._master_status()    # master binlog position
+
+        # Let slaves catch up master's binlog If master is alive, GIVEUP ANY FAILED SLAVE!
+        slaves=[]
+        force_master_ok=False
+        for inst in self.slave_wrappers:
+            status=self._slave_status(inst)
+            if not status:
+                continue 
+            if (status['Master_Host'],status['Master_Port'])!=(self.master[0],self.master[1]):
+                continue 
+            if not status['Master_Log_File']:
+                continue
+            if master_alive:
+                if not self._start_slave(inst):
+                    continue
+                if not self._slave_wait_binlog(inst,master_status): # wait master binlog position
+                    continue
+            if not self._stop_io(inst):
+                continue
+            slaves.append(inst)
+            if force_master and (inst.host,inst.port)==(force_master[0],force_master[1]):
+                force_master_ok=True
+            
+        if len(slaves)==0:
+            raise Exception('no valid slaves to elect')
         
-        # 4，所有SLAVE节点stop slave停止sql_thread
-        for i in range(len(SLAVES)):
-            slave_wrappers[i].exec('stop slave')
+        if force_master and not force_master_ok:
+            raise Exception('force_master is not reachable')
+    
+        # Let slaves execute all its relay log
+        for inst in slaves:
+            if not self._slave_wait_relay(inst):
+                raise Exception('slave relay wait timeout')
+            if not self._slave_stop_slave(inst):
+                raise Exception('stop slave fail')
 
-        # 5，所有SLAVE节点change master to新Master，并start slave
-        for i in range(len(SLAVES)):
-            if i==latest_slave_idx:
-               continue
-            error=slave_wrappers[i].exec("CHANGE MASTER TO MASTER_HOST='{}', MASTER_PORT={},MASTER_USER='{}',MASTER_PASSWORD='{}',MASTER_AUTO_POSITION=1".format(
-                SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1],SLAVES[latest_slave_idx][2],SLAVES[latest_slave_idx][3]
-            ))
-            print('【Slave指向新Master】Slave->{}:{},新Master->{}:{}'.format(SLAVES[i][0],SLAVES[i][1],SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1]))
+        # Select the latest slave as the new master
+        new_master=self._find_latest_slave(slaves)
+        if force_master and (new_master.host,new_master.port)!=(force_master[0],force_master[1]):
+            raise Exception('force_master is not the latest slave, you should only consider force_master when do online-switch but not auto-failover')
 
-        # 6，新Master执行reset slave all关停slave角色
+        # Change the other slaves to the new master
+        if not self._off_readonly(new_master):
+            raise Exception('new master off readonly fail')
+        if not self._reset_slave(new_master):
+            raise Exception('new master reset slave fail')
+        for inst in slaves:
+            if inst!=new_master:
+                if not self._change_master(inst,new_master):
+                    raise Exception('change master fail')
+        
+        topology={
+            'old_master':self.master,
+            'new_master':(new_master.host,new_master.port,new_master.user,new_master.password),
+            'good_slaves':[],
+            'unknown_slaves':[],
+        }
+        for s in self.slave_wrappers:
+            s_info=(s.host,s.port,s.user,s.password)
+            if s in slaves:
+                if s!=new_master:
+                    topology['good_slaves'].append(s_info)
+            else:
+                topology['unknown_slaves'].append(s_info)
+        return topology
 
-        # 7，新Master执行set read_only=0开放写入
-        # 8，执行Hook，通知变更完成、或者通知切换异常
-    except Exception as e:
-        print('【Failover异常】{}'.format(e))
-    else:
-        print('【Failover成功】新Master->{}:{}'.format(SLAVES[latest_slave_idx][0],SLAVES[latest_slave_idx][1]))
-    finally:
-        with open('failover.flag','w',encoding='utf-8') as fp:  # 禁止连续切换
-            pass
-    break
+if __name__=='__main__':
+    import json,os,sys  
+    if os.path.exists('topology'):
+        print('topology exists, remove it before run')
+        sys.exit(1)
+    #stop slave;CHANGE MASTER TO MASTER_HOST="10.0.0.235", MASTER_PORT=3306,MASTER_USER='root',MASTER_PASSWORD='baidu@123',MASTER_AUTO_POSITION=1;start slave;show slave status\G;
+    cluster=MasterSlaves(master=('10.0.0.235',3306,'root','baidu@123'),slaves=[('10.0.0.236',3306,'root','baidu@123'),('10.0.0.240',3306,'root','baidu@123')])
+    topology=cluster.switch() # MySQL集群的整体协调太复杂,HA逻辑没法回滚
+    with open('topology','w') as fp:
+        json.dump(topology,fp)
