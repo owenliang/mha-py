@@ -167,7 +167,7 @@ class MasterSlaves:
             return False 
         return True
 
-    def _find_latest_slave(self,slaves):
+    def _find_latest_slave(self,slaves,force_master):
         latest_Master_Log_File=''
         latest_Read_Master_Log_Pos=0
         latest_slave=None
@@ -177,7 +177,10 @@ class MasterSlaves:
                 return False 
             Master_Log_File=status['Master_Log_File']
             Read_Master_Log_Pos=status['Read_Master_Log_Pos']
-            if Master_Log_File>latest_Master_Log_File or (Master_Log_File==latest_Master_Log_File and Read_Master_Log_Pos>latest_Read_Master_Log_Pos):
+            if Master_Log_File>latest_Master_Log_File or (Master_Log_File==latest_Master_Log_File and Read_Master_Log_Pos>=latest_Read_Master_Log_Pos):
+                if (Master_Log_File,Read_Master_Log_Pos)==(latest_Master_Log_File,latest_Read_Master_Log_Pos):  # if position is same, then prefer the forced master
+                    if force_master and latest_slave and (latest_slave.host,latest_slave.port)==(force_master[0],force_master[1]):
+                        continue 
                 latest_slave=s
                 latest_Master_Log_File=Master_Log_File
                 latest_Read_Master_Log_Pos=Read_Master_Log_Pos
@@ -227,7 +230,7 @@ class MasterSlaves:
                 raise Exception('stop slave fail')
 
         # Select the latest slave as the new master
-        new_master=self._find_latest_slave(slaves)
+        new_master=self._find_latest_slave(slaves,force_master)
         if force_master and (new_master.host,new_master.port)!=(force_master[0],force_master[1]):
             raise Exception('force_master is not the latest slave, you should only consider force_master when do online-switch but not auto-failover')
 
@@ -239,7 +242,12 @@ class MasterSlaves:
         for inst in slaves:
             if inst!=new_master:
                 if not self._change_master(inst,new_master):
-                    raise Exception('change master fail')
+                    raise Exception('slave fails to change master')
+        
+        # Change old master to the new master if this is online-switch
+        if master_alive:
+            if not self._change_master(self.master_wrapper,new_master):
+                raise Exception('old master fails to change master')
         
         topology={
             'old_master':self.master,
@@ -259,10 +267,29 @@ class MasterSlaves:
 if __name__=='__main__':
     import json,os,sys  
     if os.path.exists('topology'):
-        print('topology exists, remove it before run')
+        print('you need to handle the previous HA event')
         sys.exit(1)
+    
+    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600  oltp_read_write prepare
+    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600   --threads=2 --percentile=95 --report-interval=1 oltp_read_write run
+    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600   --threads=2 --percentile=95  oltp_read_write cleanup
     #stop slave;CHANGE MASTER TO MASTER_HOST="10.0.0.235", MASTER_PORT=3306,MASTER_USER='root',MASTER_PASSWORD='baidu@123',MASTER_AUTO_POSITION=1;start slave;show slave status\G;
     cluster=MasterSlaves(master=('10.0.0.235',3306,'root','baidu@123'),slaves=[('10.0.0.236',3306,'root','baidu@123'),('10.0.0.240',3306,'root','baidu@123')])
-    topology=cluster.switch() # MySQL集群的整体协调太复杂,HA逻辑没法回滚
-    with open('topology','w') as fp:
-        json.dump(topology,fp)
+    fail_times=0
+    while True:
+        master_alive=cluster.is_master_alive()
+        if not master_alive:
+            fail_times+=1
+        else:
+            fail_times=0
+        if fail_times>=5:
+            try:
+                topology=cluster.switch() # MySQL集群的整体协调太复杂,HA逻辑没法回滚
+                print('auto-failover done')
+            finally:
+                with open('topology','w') as fp:
+                    json.dump(topology,fp)
+                sys.exit(0)
+        else:
+            print('master still alive...')
+            time.sleep(1)
