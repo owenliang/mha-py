@@ -1,6 +1,7 @@
 import pymysql
 from pymysql.cursors import DictCursor
 import time 
+from hooks import before_ha,after_ha
 
 class DBWrapper:
     def __init__(self,host,port,user,password):
@@ -186,7 +187,7 @@ class MasterSlaves:
                 latest_Read_Master_Log_Pos=Read_Master_Log_Pos
         return latest_slave
 
-    def switch(self,force_master=None):   
+    def _switch(self,force_master=None):  
         # try to set master read only
         master_alive=self.is_master_alive()
         if master_alive:
@@ -262,34 +263,16 @@ class MasterSlaves:
                     topology['good_slaves'].append(s_info)
             else:
                 topology['unknown_slaves'].append(s_info)
+        if master_alive:
+            topology['good_slaves'].append(self.master)
         return topology
-
-if __name__=='__main__':
-    import json,os,sys  
-    if os.path.exists('topology'):
-        print('you need to handle the previous HA event')
-        sys.exit(1)
     
-    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600  oltp_read_write prepare
-    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600   --threads=2 --percentile=95 --report-interval=1 oltp_read_write run
-    # sysbench --db-driver=mysql --mysql-host=10.0.0.235 --mysql-port=3306 --mysql-user=root --mysql-password='baidu@123' --mysql-db=sbtest --table_size=25000 --tables=250 --events=0 --time=600   --threads=2 --percentile=95  oltp_read_write cleanup
-    #stop slave;CHANGE MASTER TO MASTER_HOST="10.0.0.235", MASTER_PORT=3306,MASTER_USER='root',MASTER_PASSWORD='baidu@123',MASTER_AUTO_POSITION=1;start slave;show slave status\G;
-    cluster=MasterSlaves(master=('10.0.0.235',3306,'root','baidu@123'),slaves=[('10.0.0.236',3306,'root','baidu@123'),('10.0.0.240',3306,'root','baidu@123')])
-    fail_times=0
-    while True:
-        master_alive=cluster.is_master_alive()
-        if not master_alive:
-            fail_times+=1
-        else:
-            fail_times=0
-        if fail_times>=5:
-            try:
-                topology=cluster.switch() # MySQL集群的整体协调太复杂,HA逻辑没法回滚
-                print('auto-failover done')
-            finally:
-                with open('topology','w') as fp:
-                    json.dump(topology,fp)
-                sys.exit(0)
-        else:
-            print('master still alive...')
-            time.sleep(1)
+    def switch(self,force_master=None):
+        before_ha(self)
+        try:
+            topology=self._switch(force_master)
+            after_ha(self,topology)
+            return topology
+        except Exception as e:
+            after_ha(self,{},e)
+            raise e
