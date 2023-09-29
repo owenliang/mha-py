@@ -206,6 +206,8 @@ class MasterSlaves:
                 continue 
             if not status['Master_Log_File']:
                 continue
+            if status['Slave_SQL_Running']!='Yes':
+                continue
             if master_alive:
                 if not self._start_slave(inst):
                     continue
