@@ -2,6 +2,18 @@
 
 基于MHA,Orchestrator的实现和思想, 用Python实现简单易用的MySQL HA工具
 
+## 切换逻辑
+
+* 老master设置readonly，然后kill掉存量所有连接
+* 如果老master活着（表示online-switch），那么等slave追上master的binlog；如果master死了，那么不等binlog追平；无论如何， 最终都停掉io_thread
+* 等待slave执行完存量relay log
+* 选slave中binlog position最新的作为候选master;
+* 候选master取消read_only并reset slave all，其他slave执行change master指向它
+* 如果老master活着（表示online-switch）,那么老master也change master指向候选master
+* 记录新的拓扑关系到锁文件
+
+HA执行后会产生failover.once文件,程序将无法再次启动,必须介入修改conf.py中的主从关系到最新状态,删除failover.once并重启程序进入下一轮HA监控
+
 ## 脚本说明
 
 conf.py: 配置主从实例的连接信息
